@@ -15,7 +15,7 @@ class Finding:
 class DiagnoseEngine:
     """
     Reads benchmark results and produces opinionated findings.
-    This is the FDE layer — not just measuring, but diagnosing.
+    This is the FDE layer - not just measuring, but diagnosing.
     """
 
     def diagnose(self, result: BenchmarkResult) -> list[Finding]:
@@ -32,7 +32,7 @@ class DiagnoseEngine:
         return sorted(findings, key=lambda f: {"critical": 0, "warning": 1, "info": 2}[f.severity])
 
     def diagnose_comparison(self, results: list[BenchmarkResult]) -> list[Finding]:
-        """Diagnose across multiple runs — find the best config and explain why."""
+        """Diagnose across multiple runs - find the best config and explain why."""
         findings = []
         findings.extend(self._compare_backends(results))
         findings.extend(self._find_pareto_optimal(results))
@@ -152,7 +152,7 @@ class DiagnoseEngine:
                 title=f"High TTFT variance (p99/p50 = {result.ttft_p99/result.ttft_p50:.1f}x)",
                 detail=f"TTFT ranges from {result.ttft_p50:.0f}ms (p50) to "
                        f"{result.ttft_p99:.0f}ms (p99). This suggests inconsistent behavior "
-                       f"— possibly cold starts, GC pauses, or request queuing.",
+                       f"- possibly cold starts, GC pauses, or request queuing.",
                 recommendation="Investigate the slow outliers. If using serverless (Modal), "
                               "consider keep-alive to avoid cold starts on the tail.",
                 expected_impact="More predictable user experience",
@@ -311,9 +311,9 @@ class DiagnoseEngine:
                 detail=f"{best_latency.config.backend} is fastest per-request but "
                        f"{best_throughput.config.backend} moves more total tokens. "
                        f"This is the classic latency-throughput tradeoff.",
-                recommendation="Choose based on workload: real-time chat \u2192 optimize latency. "
-                              "Batch processing \u2192 optimize throughput. "
-                              "Mixed \u2192 use both backends with routing.",
+                recommendation="Choose based on workload: real-time chat -> optimize latency. "
+                              "Batch processing -> optimize throughput. "
+                              "Mixed -> use both backends with routing.",
                 expected_impact="Right backend for each workload type",
             ))
         return findings
@@ -392,13 +392,13 @@ def format_findings(findings: list[Finding]) -> str:
     if not findings:
         return "No significant findings. Performance looks healthy."
 
-    icons = {"critical": "\U0001f534", "warning": "\U0001f7e1", "info": "\U0001f535"}
+    icons = {"critical": "[critical]", "warning": "[warning]", "info": "[info]"}
     lines = ["\n## Findings\n"]
 
     for i, f in enumerate(findings, 1):
         lines.append(f"{icons[f.severity]} **{f.title}**")
         lines.append(f"   {f.detail}")
-        lines.append(f"   \u2192 {f.recommendation}")
+        lines.append(f"   -> {f.recommendation}")
         lines.append(f"   Expected impact: {f.expected_impact}")
         lines.append("")
 

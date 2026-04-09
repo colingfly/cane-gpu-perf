@@ -1,4 +1,4 @@
-"""Benchmark runner — sends requests to inference backends and collects metrics."""
+"""Benchmark runner - sends requests to inference backends and collects metrics."""
 
 import asyncio
 import time
@@ -24,7 +24,7 @@ PROMPT_SETS = {
         "What's the difference between fine-tuning and prompt engineering?",
         "Can you give me a practical example of RAG?",
         "How do I choose the right model size for my use case?",
-        "Thanks! One more question — what about model distillation?",
+        "Thanks! One more question - what about model distillation?",
     ],
     "rag": [
         (

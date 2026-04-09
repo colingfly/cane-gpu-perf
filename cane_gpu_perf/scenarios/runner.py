@@ -53,10 +53,10 @@ class ScenarioRunner:
         # Summary verdict
         passed = all(f.severity != "critical" for f in sla_findings)
         if passed:
-            console.print(Panel("[bold green]\u2705 PASS[/bold green] \u2014 All success criteria met.",
+            console.print(Panel("[bold green]PASS[/bold green] - All success criteria met.",
                                border_style="green"))
         else:
-            console.print(Panel("[bold red]\u274c FAIL[/bold red] \u2014 One or more criteria not met.",
+            console.print(Panel("[bold red]FAIL[/bold red] - One or more criteria not met.",
                                border_style="red"))
 
         return {

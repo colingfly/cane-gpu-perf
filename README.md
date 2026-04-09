@@ -1,12 +1,6 @@
 # cane-gpu-perf
 
-GPU inference benchmarking with opinionated diagnostics. Don't just measure — diagnose.
-
-## Install
-
-```bash
-pip install -e .
-```
+GPU inference benchmarking with opinionated diagnostics.
 
 ## Quick Start
 
@@ -31,19 +25,19 @@ Output:
 ```
 ## Findings
 
-🔴 GPU severely under-utilized (38%)
+[critical] GPU severely under-utilized (38%)
    GPU is idle more than half the time, waiting for data.
-   → Increase batch size or concurrency. Try --concurrency 8.
+   -> Increase batch size or concurrency. Try --concurrency 8.
    Expected impact: 2-4x throughput improvement
 
-🟡 High TTFT variance (p99/p50 = 6.2x)
+[warning] High TTFT variance (p99/p50 = 6.2x)
    Some requests take 6x longer than median.
-   → Investigate cold starts or KV cache eviction.
+   -> Investigate cold starts or KV cache eviction.
    Expected impact: More predictable user experience
 
-🔵 Pareto-optimal configs: vllm, sglang
+[info] Pareto-optimal configs: vllm, sglang
    Out of 4 configs, 2 are on the Pareto frontier.
-   → Choose vllm for latency, sglang for structured output.
+   -> Choose vllm for latency, sglang for structured output.
    Expected impact: Eliminate suboptimal configurations
 ```
 
@@ -62,13 +56,13 @@ Available scenarios: `chatbot`, `rag`, `batch`, `code`
 
 ```
 cane_gpu_perf/
-├── config.py          # BenchmarkConfig, BenchmarkResult dataclasses
-├── utils/tokens.py    # tiktoken-based token counting
-├── bench/runner.py    # Benchmark runner (streaming HTTP, metrics collection)
-├── diagnose/engine.py # DiagnoseEngine — opinionated findings
-├── scenarios/         # Workload scenarios (chatbot, rag, batch, code)
-│   ├── base.py        # Scenario dataclass
-│   ├── runner.py      # ScenarioRunner (multi-phase + SLA checks)
-│   └── *.py           # Individual scenario definitions
-└── cli/main.py        # CLI entry point
+  config.py          # BenchmarkConfig, BenchmarkResult dataclasses
+  utils/tokens.py    # tiktoken-based token counting
+  bench/runner.py    # Benchmark runner (streaming HTTP, metrics collection)
+  diagnose/engine.py # DiagnoseEngine, opinionated findings
+  scenarios/         # Workload scenarios (chatbot, rag, batch, code)
+    base.py          # Scenario dataclass
+    runner.py        # ScenarioRunner (multi-phase + SLA checks)
+    *.py             # Individual scenario definitions
+  cli/main.py        # CLI entry point
 ```
