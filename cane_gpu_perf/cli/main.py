@@ -34,6 +34,13 @@ def cmd_bench(args):
     console.print(f"  Throughput: {result.aggregate_tps:.1f} tok/s aggregate, {result.tokens_per_second_mean:.1f} tok/s mean per-request")
     console.print(f"  RPS:       {result.requests_per_second:.2f} req/s")
 
+    if result.failed_requests > 0:
+        errors = [r["error"] for r in result.individual_results if r.get("error")]
+        unique_errors = list(set(errors))
+        console.print(f"\n[bold]Errors ({len(errors)} total, {len(unique_errors)} unique):[/bold]")
+        for err in unique_errors[:5]:
+            console.print(f"  - {err}")
+
     if args.diagnose:
         engine = DiagnoseEngine()
         findings = engine.diagnose(result)

@@ -199,6 +199,7 @@ class BenchmarkRunner:
                 config=config,
                 total_requests=len(results),
                 failed_requests=len(failed),
+                individual_results=results,
             )
 
         latencies = [r["latency_ms"] for r in successful]

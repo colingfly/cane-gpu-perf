@@ -392,7 +392,7 @@ def format_findings(findings: list[Finding]) -> str:
     if not findings:
         return "No significant findings. Performance looks healthy."
 
-    icons = {"critical": "[critical]", "warning": "[warning]", "info": "[info]"}
+    icons = {"critical": "CRITICAL:", "warning": "WARNING:", "info": "INFO:"}
     lines = ["\n## Findings\n"]
 
     for i, f in enumerate(findings, 1):

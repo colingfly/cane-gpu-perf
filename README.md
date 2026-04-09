@@ -25,17 +25,17 @@ Output:
 ```
 ## Findings
 
-[critical] GPU severely under-utilized (38%)
+CRITICAL: GPU severely under-utilized (38%)
    GPU is idle more than half the time, waiting for data.
    -> Increase batch size or concurrency. Try --concurrency 8.
    Expected impact: 2-4x throughput improvement
 
-[warning] High TTFT variance (p99/p50 = 6.2x)
+WARNING: High TTFT variance (p99/p50 = 6.2x)
    Some requests take 6x longer than median.
    -> Investigate cold starts or KV cache eviction.
    Expected impact: More predictable user experience
 
-[info] Pareto-optimal configs: vllm, sglang
+INFO: Pareto-optimal configs: vllm, sglang
    Out of 4 configs, 2 are on the Pareto frontier.
    -> Choose vllm for latency, sglang for structured output.
    Expected impact: Eliminate suboptimal configurations
