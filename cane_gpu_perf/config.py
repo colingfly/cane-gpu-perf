@@ -1,5 +1,7 @@
 """Core configuration and result dataclasses."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 
 
@@ -16,6 +18,7 @@ class BenchmarkConfig:
     base_url: str | None = None
     api_key: str | None = None
     timeout: float = 120.0
+    deep: bool = False  # enable GPU telemetry + hardware diagnostics
 
 
 @dataclass
@@ -41,10 +44,32 @@ class BenchmarkResult:
     total_requests: int = 0
     failed_requests: int = 0
 
-    # GPU metrics
+    # -- Prefill / decode phase separation --
+    prefill_throughput_tps: float = 0.0      # input tokens / TTFT (aggregate)
+    decode_throughput_tps: float = 0.0       # output tokens / decode time (aggregate)
+    decode_latency_p50_ms: float = 0.0       # inter-token latency
+    decode_latency_p95_ms: float = 0.0
+    decode_latency_p99_ms: float = 0.0
+    prefill_fraction: float = 0.0            # TTFT / total latency (mean)
+
+    # -- GPU telemetry (populated when deep=True) --
+    gpu_telemetry: list | None = None  # list[GpuTimeSeries]
     gpu_utilization_mean: float | None = None
     peak_gpu_memory_gb: float | None = None
     gpu_info: dict | None = None
+
+    # -- Roofline analysis --
+    roofline: dict | None = None  # {"classification", "compute_pct", "bandwidth_pct", ...}
+
+    # -- Power & efficiency --
+    tokens_per_watt: float | None = None
+    tokens_per_joule: float | None = None
+    power_cost_per_1m_tokens: float | None = None
+    thermal_headroom_c: float | None = None
+    clock_throttle_ratio: float | None = None
+
+    # -- Multi-GPU topology --
+    topology: dict | None = None  # {"gpu_count", "interconnect", "balance", ...}
 
     # Cost
     cost_per_1k_tokens: float | None = None

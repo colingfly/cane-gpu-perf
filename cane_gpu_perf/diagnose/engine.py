@@ -5,7 +5,7 @@ from cane_gpu_perf.config import BenchmarkResult
 @dataclass
 class Finding:
     severity: str       # "critical", "warning", "info"
-    category: str       # "throughput", "latency", "memory", "cost", "config"
+    category: str       # "throughput", "latency", "memory", "cost", "config", "roofline", "thermal", "efficiency", "scaling", "phase_balance"
     title: str          # one-line summary
     detail: str         # explanation
     recommendation: str # what to do about it
@@ -29,6 +29,17 @@ class DiagnoseEngine:
         findings.extend(self._check_memory(result))
         findings.extend(self._check_cost_efficiency(result))
         findings.extend(self._check_context_scaling(result))
+
+        # Deep GPU diagnostics
+        if result.config.deep:
+            findings.extend(self._check_phase_balance(result))
+            findings.extend(self._check_roofline(result))
+            findings.extend(self._check_thermal(result))
+            findings.extend(self._check_power_efficiency(result))
+            findings.extend(self._check_multi_gpu_balance(result))
+            findings.extend(self._check_memory_pressure(result))
+            findings.extend(self._check_decode_performance(result))
+
         return sorted(findings, key=lambda f: {"critical": 0, "warning": 1, "info": 2}[f.severity])
 
     def diagnose_comparison(self, results: list[BenchmarkResult]) -> list[Finding]:
@@ -38,6 +49,10 @@ class DiagnoseEngine:
         findings.extend(self._find_pareto_optimal(results))
         findings.extend(self._check_scaling_behavior(results))
         return findings
+
+    # ----------------------------------------------------------------
+    # Original diagnostics
+    # ----------------------------------------------------------------
 
     def _check_gpu_utilization(self, result: BenchmarkResult) -> list[Finding]:
         findings = []
@@ -269,6 +284,408 @@ class DiagnoseEngine:
 
     def _check_context_scaling(self, result: BenchmarkResult) -> list[Finding]:
         return []
+
+    # ----------------------------------------------------------------
+    # Deep GPU diagnostics (require --deep / config.deep=True)
+    # ----------------------------------------------------------------
+
+    def _check_phase_balance(self, result: BenchmarkResult) -> list[Finding]:
+        """Analyze prefill vs decode time distribution."""
+        findings = []
+
+        if result.prefill_fraction <= 0:
+            return findings
+
+        pf = result.prefill_fraction
+
+        if pf > 0.5:
+            findings.append(Finding(
+                severity="warning",
+                category="phase_balance",
+                title=f"Prefill-dominated workload ({pf*100:.0f}% of time in prefill)",
+                detail=f"The prefill phase (prompt processing) consumes {pf*100:.0f}% of total "
+                       f"request time. This means the GPU is spending most of its time on "
+                       f"compute-heavy matrix multiplications over the input, not generating tokens.",
+                recommendation="Reduce prompt length, enable chunked prefill, or use prefix caching "
+                              "to amortize repeated prefill work. If prompts are long, consider "
+                              "FlashAttention or FlashInfer for faster attention computation.",
+                expected_impact="Faster TTFT and more time spent in decode (actual generation)",
+            ))
+        elif pf < 0.1 and result.ttft_p50 > 0:
+            findings.append(Finding(
+                severity="info",
+                category="phase_balance",
+                title=f"Decode-dominated workload ({(1-pf)*100:.0f}% of time in decode)",
+                detail=f"Prefill is only {pf*100:.0f}% of total time. "
+                       f"Decode throughput ({result.decode_throughput_tps:.1f} tok/s) "
+                       f"is the primary bottleneck.",
+                recommendation="Optimize decode: speculative decoding, quantization (reduces "
+                              "bytes per token), or multi-query/grouped-query attention.",
+                expected_impact="Higher token generation throughput",
+            ))
+
+        # Report prefill and decode throughput
+        if result.prefill_throughput_tps > 0 and result.decode_throughput_tps > 0:
+            ratio = result.prefill_throughput_tps / result.decode_throughput_tps
+            findings.append(Finding(
+                severity="info",
+                category="phase_balance",
+                title=f"Prefill {result.prefill_throughput_tps:.0f} tok/s vs decode {result.decode_throughput_tps:.0f} tok/s ({ratio:.1f}x)",
+                detail=f"Prefill throughput: {result.prefill_throughput_tps:.0f} input tok/s. "
+                       f"Decode throughput: {result.decode_throughput_tps:.0f} output tok/s. "
+                       f"Prefill is {ratio:.1f}x faster because it processes tokens in parallel "
+                       f"(compute-bound), while decode is sequential (memory-bandwidth-bound).",
+                recommendation="This ratio is expected. Focus optimization on whichever phase "
+                              "dominates your workload: long prompts -> optimize prefill, "
+                              "long outputs -> optimize decode.",
+                expected_impact="Targeted optimization based on workload profile",
+            ))
+
+        return findings
+
+    def _check_roofline(self, result: BenchmarkResult) -> list[Finding]:
+        """Roofline model analysis - compute vs memory-bandwidth bound."""
+        findings = []
+
+        if not result.gpu_telemetry or not result.gpu_info:
+            return findings
+
+        from cane_gpu_perf.gpu.roofline import analyze_roofline
+
+        gpu_name = result.gpu_info.get("name", "")
+        prompt_tokens_mean = 0.0
+        successful = [r for r in result.individual_results if r.get("error") is None]
+        if successful:
+            prompt_tokens_mean = sum(r.get("prompt_tokens", 0) for r in successful) / len(successful)
+
+        # Get NVML memory utilization from telemetry
+        mem_util = None
+        if result.gpu_telemetry:
+            snapshots = result.gpu_telemetry[0].snapshots
+            if snapshots:
+                mem_util = sum(s.utilization_memory for s in snapshots) / len(snapshots) / 100.0
+
+        roofline = analyze_roofline(
+            gpu_name=gpu_name,
+            model_name=result.config.model,
+            prefill_throughput_tps=result.prefill_throughput_tps,
+            decode_throughput_tps=result.decode_throughput_tps,
+            prompt_tokens_mean=prompt_tokens_mean,
+            gpu_utilization_mean=result.gpu_utilization_mean,
+            mem_bw_utilization=mem_util,
+        )
+
+        if roofline is None:
+            return findings
+
+        # Store roofline in result for downstream use
+        result.roofline = {
+            "classification": roofline.classification,
+            "compute_pct": roofline.achieved_compute_pct,
+            "bandwidth_pct": roofline.achieved_bandwidth_pct,
+            "peak_fp16_tflops": roofline.peak_fp16_tflops,
+            "peak_mem_bw_gbps": roofline.peak_mem_bw_gbps,
+            "ridge_point": roofline.ridge_point,
+            "bottleneck_phase": roofline.bottleneck_phase,
+            "decode_bw_util": roofline.decode_bandwidth_utilization,
+        }
+
+        if roofline.classification == "memory-bound":
+            findings.append(Finding(
+                severity="info",
+                category="roofline",
+                title=f"Memory-bandwidth-bound ({roofline.achieved_bandwidth_pct:.0f}% of {roofline.peak_mem_bw_gbps:.0f} GB/s)",
+                detail=f"Workload is memory-bandwidth-bound on {roofline.gpu_name}. "
+                       f"Decode phase uses {roofline.decode_bandwidth_utilization*100:.0f}% of "
+                       f"{roofline.peak_mem_bw_gbps:.0f} GB/s peak bandwidth. "
+                       f"This is expected for autoregressive LLM generation -- each output token "
+                       f"requires reading model weights from HBM.",
+                recommendation="Reduce bytes per token: INT8/INT4 quantization (linear speedup for "
+                              "memory-bound workloads), grouped-query attention (reduces KV cache reads), "
+                              "or speculative decoding (amortizes weight reads over multiple tokens).",
+                expected_impact="INT8: ~2x decode throughput. INT4: ~4x. Speculative decoding: 2-3x.",
+            ))
+        elif roofline.classification == "compute-bound":
+            findings.append(Finding(
+                severity="info",
+                category="roofline",
+                title=f"Compute-bound ({roofline.achieved_compute_pct:.0f}% of {roofline.peak_fp16_tflops:.0f} TFLOPS)",
+                detail=f"Workload is compute-bound on {roofline.gpu_name}. "
+                       f"GPU SM utilization at {roofline.achieved_compute_pct:.0f}% of peak "
+                       f"{roofline.peak_fp16_tflops:.0f} FP16 TFLOPS. "
+                       f"This is typical for prefill-heavy workloads with long prompts.",
+                recommendation="Use FlashAttention/FlashInfer for attention computation. "
+                              "Enable tensor parallelism across GPUs to distribute compute. "
+                              "Consider chunked prefill to overlap prefill with decode.",
+                expected_impact="FlashAttention: 2-4x prefill speedup. TP: near-linear scaling.",
+            ))
+        elif roofline.classification == "under-utilized":
+            findings.append(Finding(
+                severity="warning",
+                category="roofline",
+                title=f"Under-utilizing both compute ({roofline.achieved_compute_pct:.0f}%) and bandwidth ({roofline.achieved_bandwidth_pct:.0f}%)",
+                detail=f"Neither compute nor memory bandwidth is near capacity on {roofline.gpu_name}. "
+                       f"The GPU has {roofline.peak_fp16_tflops:.0f} TFLOPS and "
+                       f"{roofline.peak_mem_bw_gbps:.0f} GB/s available but the workload isn't "
+                       f"using either. This points to a CPU-side or scheduling bottleneck.",
+                recommendation="Increase concurrency/batch size to feed the GPU. Check for CPU "
+                              "bottlenecks (tokenization, data loading). Verify the serving framework "
+                              "is using continuous batching.",
+                expected_impact="2-10x throughput by saturating the GPU",
+            ))
+
+        return findings
+
+    def _check_thermal(self, result: BenchmarkResult) -> list[Finding]:
+        """Thermal throttling detection."""
+        findings = []
+
+        if not result.gpu_telemetry:
+            return findings
+
+        ts = result.gpu_telemetry[0]
+
+        # Clock throttling
+        if ts.clock_throttle_ratio > 0.1:
+            findings.append(Finding(
+                severity="warning" if ts.clock_throttle_ratio > 0.3 else "info",
+                category="thermal",
+                title=f"GPU clock throttled {ts.clock_throttle_ratio*100:.0f}% of benchmark",
+                detail=f"SM clock dropped below 90% of max ({ts.clock_max_sm_mhz} MHz) during "
+                       f"{ts.clock_throttle_ratio*100:.0f}% of the benchmark. "
+                       f"Min clock: {ts.clock_sm_min_mhz} MHz, mean: {ts.clock_sm_mean_mhz:.0f} MHz. "
+                       f"Peak temperature: {ts.temperature_peak_c}C.",
+                recommendation="Check GPU cooling. If in a data center, verify airflow. "
+                              "Consider lowering power limit for more stable (if slightly lower) clocks. "
+                              "Sustained stable clocks often beat higher-but-throttled clocks.",
+                expected_impact="More consistent latency, potentially higher sustained throughput",
+            ))
+
+        # Temperature warning
+        if ts.temperature_peak_c >= 80:
+            findings.append(Finding(
+                severity="warning" if ts.temperature_peak_c >= 85 else "info",
+                category="thermal",
+                title=f"GPU peak temperature {ts.temperature_peak_c}C (mean {ts.temperature_mean_c:.0f}C)",
+                detail=f"GPU reached {ts.temperature_peak_c}C during benchmark. "
+                       f"Data center GPUs typically throttle at 83C. "
+                       f"Mean temperature was {ts.temperature_mean_c:.0f}C.",
+                recommendation="Improve cooling or reduce power limit. At these temperatures, "
+                              "the GPU may be silently throttling clocks to stay within thermal envelope.",
+                expected_impact="Stable performance without thermal-induced variance",
+            ))
+
+        return findings
+
+    def _check_power_efficiency(self, result: BenchmarkResult) -> list[Finding]:
+        """Power and energy efficiency analysis."""
+        findings = []
+
+        if not result.gpu_telemetry:
+            return findings
+
+        from cane_gpu_perf.gpu.efficiency import analyze_efficiency
+
+        ts = result.gpu_telemetry[0]
+        total_tokens = sum(r.get("output_tokens", 0) for r in result.individual_results
+                          if r.get("error") is None)
+
+        report = analyze_efficiency(
+            gpu_telemetry=ts,
+            aggregate_tps=result.aggregate_tps,
+            total_tokens=total_tokens,
+            duration_s=ts.duration_s,
+        )
+
+        if report is None:
+            return findings
+
+        # Store efficiency metrics in result
+        result.tokens_per_watt = report.tokens_per_watt
+        result.tokens_per_joule = report.tokens_per_joule
+        if report.power_cost_per_1m_tokens is not None:
+            result.power_cost_per_1m_tokens = report.power_cost_per_1m_tokens
+
+        # Energy efficiency finding
+        findings.append(Finding(
+            severity="info",
+            category="efficiency",
+            title=f"Energy: {report.tokens_per_watt:.1f} tok/W, {report.tokens_per_joule:.2f} tok/J",
+            detail=f"Power draw: {report.power_mean_w:.0f}W mean / {report.power_peak_w:.0f}W peak "
+                   f"(limit: {report.power_limit_w:.0f}W, {report.power_headroom_pct:.0f}% headroom). "
+                   f"Total energy: {report.total_energy_j:.0f}J for {report.total_tokens} tokens.",
+            recommendation="Compare across quantization levels: INT8 typically doubles tok/W "
+                          "for memory-bound workloads. Lower power limits can improve tok/J "
+                          "at the cost of some throughput.",
+            expected_impact="Quantization: ~2x energy efficiency for decode",
+        ))
+
+        # Cost estimate
+        if report.power_cost_per_1m_tokens is not None:
+            findings.append(Finding(
+                severity="info",
+                category="efficiency",
+                title=f"Power cost: ${report.power_cost_per_1m_tokens:.4f}/1M tokens (at ${report.electricity_rate_kwh:.2f}/kWh)",
+                detail=f"Based on {report.power_mean_w:.0f}W mean draw at "
+                       f"${report.electricity_rate_kwh:.2f}/kWh, electricity alone costs "
+                       f"${report.power_cost_per_1m_tokens:.4f} per 1M output tokens. "
+                       f"This excludes GPU amortization, cooling, and infrastructure.",
+                recommendation="For TCO analysis, multiply power cost by ~3x for full "
+                              "data center overhead (cooling, networking, redundancy).",
+                expected_impact="Informed capacity planning and cost modeling",
+            ))
+
+        # Power headroom
+        if report.power_headroom_pct > 30:
+            findings.append(Finding(
+                severity="info",
+                category="efficiency",
+                title=f"Power headroom: {report.power_headroom_pct:.0f}% below limit",
+                detail=f"GPU drawing {report.power_mean_w:.0f}W vs {report.power_limit_w:.0f}W limit. "
+                       f"The GPU has significant power headroom, suggesting it could clock higher "
+                       f"or handle more work.",
+                recommendation="Increase concurrency to push utilization up. Alternatively, "
+                              "lower the power limit to save energy without affecting throughput "
+                              "(if already memory-bound).",
+                expected_impact="Better energy efficiency or higher throughput",
+            ))
+
+        return findings
+
+    def _check_multi_gpu_balance(self, result: BenchmarkResult) -> list[Finding]:
+        """Multi-GPU utilization balance and topology analysis."""
+        findings = []
+
+        if not result.gpu_telemetry or len(result.gpu_telemetry) < 2:
+            return findings
+
+        from cane_gpu_perf.gpu.topology import analyze_gpu_balance
+
+        report = analyze_gpu_balance(result.gpu_telemetry)
+        if report is None:
+            return findings
+
+        # Store topology in result
+        result.topology = {
+            "gpu_count": report.gpu_count,
+            "interconnect": report.interconnect_type,
+            "gpu_names": report.gpu_names,
+            "utilization_per_gpu": report.utilization_per_gpu,
+            "utilization_stdev": report.utilization_stdev,
+        }
+
+        # Interconnect type
+        findings.append(Finding(
+            severity="info",
+            category="scaling",
+            title=f"{report.gpu_count} GPUs detected, {report.interconnect_type} interconnect",
+            detail=f"GPUs: {', '.join(report.gpu_names)}. "
+                   f"Interconnect: {report.interconnect_type}. "
+                   + (f"NVLink provides ~600 GB/s bidirectional bandwidth vs ~32 GB/s for PCIe Gen4."
+                      if report.interconnect_type == "nvlink" else
+                      "PCIe interconnect limits tensor parallelism efficiency for large models."
+                      if report.interconnect_type == "pcie" else ""),
+            recommendation="NVLink is preferred for tensor parallelism. PCIe is adequate for "
+                          "pipeline parallelism or independent request routing."
+                          if report.interconnect_type == "pcie" else
+                          "NVLink topology is optimal for tensor parallelism.",
+            expected_impact="Informed parallelism strategy",
+        ))
+
+        # Utilization balance
+        if report.utilization_imbalance > 0.2:
+            utils_str = ", ".join(f"GPU{i}: {u*100:.0f}%"
+                                  for i, u in enumerate(report.utilization_per_gpu))
+            findings.append(Finding(
+                severity="warning",
+                category="scaling",
+                title=f"GPU utilization imbalance: {report.utilization_imbalance*100:.0f}% spread",
+                detail=f"Per-GPU utilization: {utils_str}. "
+                       f"Standard deviation: {report.utilization_stdev*100:.1f}%. "
+                       f"This suggests uneven work distribution across GPUs.",
+                recommendation="Check tensor parallelism configuration. Uneven splits or "
+                              "pipeline bubble overhead can cause imbalance. If using pipeline "
+                              "parallelism, the last stage often has lower utilization.",
+                expected_impact="Balanced utilization could improve throughput by "
+                              f"{report.utilization_imbalance*100:.0f}%",
+            ))
+
+        return findings
+
+    def _check_memory_pressure(self, result: BenchmarkResult) -> list[Finding]:
+        """KV cache growth and OOM risk analysis."""
+        findings = []
+
+        if not result.gpu_telemetry:
+            return findings
+
+        ts = result.gpu_telemetry[0]
+
+        if ts.memory_total_mb <= 0:
+            return findings
+
+        usage_pct = ts.memory_used_peak_mb / ts.memory_total_mb
+        growth_mb = ts.memory_used_peak_mb - ts.memory_used_mean_mb
+
+        if growth_mb > 0 and usage_pct > 0.8:
+            findings.append(Finding(
+                severity="warning" if usage_pct > 0.9 else "info",
+                category="memory_pressure",
+                title=f"Memory pressure: {usage_pct*100:.0f}% peak, {growth_mb:.0f}MB growth during benchmark",
+                detail=f"Peak memory: {ts.memory_used_peak_mb:.0f}MB / {ts.memory_total_mb:.0f}MB "
+                       f"({usage_pct*100:.0f}%). Memory grew {growth_mb:.0f}MB during the benchmark, "
+                       f"likely from KV cache expansion under concurrent load.",
+                recommendation="KV cache grows with concurrency * sequence_length. At current usage, "
+                              "increasing concurrency may trigger OOM. Consider: PagedAttention (vLLM), "
+                              "KV cache quantization, or reducing max_tokens.",
+                expected_impact="Prevent OOM and maintain throughput under higher load",
+            ))
+
+        return findings
+
+    def _check_decode_performance(self, result: BenchmarkResult) -> list[Finding]:
+        """Inter-token latency analysis for decode phase."""
+        findings = []
+
+        if result.decode_latency_p50_ms <= 0:
+            return findings
+
+        itl_p50 = result.decode_latency_p50_ms
+        itl_p99 = result.decode_latency_p99_ms
+
+        # For real-time chat, inter-token latency > 100ms is noticeable
+        if itl_p50 > 100:
+            findings.append(Finding(
+                severity="warning",
+                category="phase_balance",
+                title=f"Slow decode: {itl_p50:.0f}ms inter-token latency (p50)",
+                detail=f"Inter-token latency: p50={itl_p50:.0f}ms, p95={result.decode_latency_p95_ms:.0f}ms, "
+                       f"p99={itl_p99:.0f}ms. Users perceive token-by-token streaming as smooth below "
+                       f"~50-80ms per token. At {itl_p50:.0f}ms, generation feels sluggish.",
+                recommendation="For memory-bound decode: quantize (INT8/INT4), use grouped-query attention, "
+                              "or try speculative decoding. For compute issues: reduce concurrent requests.",
+                expected_impact="Faster perceived generation speed",
+            ))
+
+        # Decode latency variance
+        if itl_p99 > itl_p50 * 4 and itl_p50 > 0:
+            findings.append(Finding(
+                severity="warning",
+                category="phase_balance",
+                title=f"Decode latency spikes (p99/p50 = {itl_p99/itl_p50:.1f}x)",
+                detail=f"Inter-token latency p99 ({itl_p99:.0f}ms) is {itl_p99/itl_p50:.1f}x the "
+                       f"median ({itl_p50:.0f}ms). Spikes indicate periodic stalls -- likely "
+                       f"attention over growing KV cache, GC pauses, or scheduling jitter.",
+                recommendation="Profile the stalls. If KV cache related, enable PagedAttention. "
+                              "If GC, check Python GC settings in the serving framework.",
+                expected_impact="Smoother token streaming",
+            ))
+
+        return findings
+
+    # ----------------------------------------------------------------
+    # Comparison diagnostics
+    # ----------------------------------------------------------------
 
     def _compare_backends(self, results: list[BenchmarkResult]) -> list[Finding]:
         """Compare multiple backend results and declare winners."""

@@ -108,6 +108,16 @@ class BenchmarkRunner:
             if key:
                 headers["Authorization"] = f"Bearer {key}"
 
+        # Start GPU telemetry if deep mode
+        gpu_collector = None
+        if config.deep:
+            from cane_gpu_perf.gpu.collector import GpuCollector
+            gpu_collector = GpuCollector(interval_ms=100)
+            started = gpu_collector.start()
+            if not started:
+                console.print("[yellow]GPU telemetry unavailable (no NVIDIA GPU or pynvml not installed)[/yellow]")
+                gpu_collector = None
+
         semaphore = asyncio.Semaphore(config.concurrency)
         individual_results = []
 
@@ -140,6 +150,7 @@ class BenchmarkRunner:
                         "ttft_ms": 0.0,
                         "latency_ms": 0.0,
                         "tokens_per_second": 0.0,
+                        "token_timestamps": [],  # per-token arrival times for decode analysis
                         "error": None,
                     }
 
@@ -158,8 +169,9 @@ class BenchmarkRunner:
                                     if data.strip() == "[DONE]":
                                         break
 
+                                    now = time.perf_counter()
                                     if first_token_time is None:
-                                        first_token_time = time.perf_counter()
+                                        first_token_time = now
                                         result["ttft_ms"] = (first_token_time - start) * 1000
 
                                     import json
@@ -169,6 +181,7 @@ class BenchmarkRunner:
                                         content = delta.get("content", "")
                                         if content:
                                             output_text += content
+                                            result["token_timestamps"].append(now)
                                     except (json.JSONDecodeError, IndexError, KeyError):
                                         pass
 
@@ -178,9 +191,22 @@ class BenchmarkRunner:
                         if result["latency_ms"] > 0:
                             result["tokens_per_second"] = result["output_tokens"] / (result["latency_ms"] / 1000)
 
+                        # Compute per-request decode metrics
+                        timestamps = result["token_timestamps"]
+                        if len(timestamps) >= 2:
+                            itls = [(timestamps[i] - timestamps[i - 1]) * 1000
+                                    for i in range(1, len(timestamps))]
+                            result["inter_token_latencies_ms"] = itls
+                            result["decode_time_ms"] = (timestamps[-1] - timestamps[0]) * 1000
+                        else:
+                            result["inter_token_latencies_ms"] = []
+                            result["decode_time_ms"] = 0.0
+
                     except Exception as e:
                         result["error"] = str(e)
                         result["latency_ms"] = (time.perf_counter() - start) * 1000
+                        result["inter_token_latencies_ms"] = []
+                        result["decode_time_ms"] = 0.0
 
                     progress.advance(task)
                     return result
@@ -188,9 +214,15 @@ class BenchmarkRunner:
             tasks = [_run_single(p) for p in prompts]
             individual_results = await asyncio.gather(*tasks)
 
-        return self._aggregate(config, list(individual_results))
+        # Stop GPU telemetry
+        gpu_telemetry = None
+        if gpu_collector:
+            gpu_telemetry = gpu_collector.stop()
 
-    def _aggregate(self, config: BenchmarkConfig, results: list[dict]) -> BenchmarkResult:
+        return self._aggregate(config, list(individual_results), gpu_telemetry)
+
+    def _aggregate(self, config: BenchmarkConfig, results: list[dict],
+                   gpu_telemetry=None) -> BenchmarkResult:
         successful = [r for r in results if r["error"] is None]
         failed = [r for r in results if r["error"] is not None]
 
@@ -217,7 +249,31 @@ class BenchmarkRunner:
             idx = min(idx, len(sorted_data) - 1)
             return sorted_data[idx]
 
-        return BenchmarkResult(
+        # Prefill / decode separation
+        all_itls = []
+        prefill_tps_values = []
+        decode_tps_values = []
+        prefill_fractions = []
+
+        for r in successful:
+            itls = r.get("inter_token_latencies_ms", [])
+            all_itls.extend(itls)
+
+            prompt_tokens = r.get("prompt_tokens", 0)
+            ttft_s = r.get("ttft_ms", 0) / 1000.0
+            if ttft_s > 0 and prompt_tokens > 0:
+                prefill_tps_values.append(prompt_tokens / ttft_s)
+
+            decode_time_ms = r.get("decode_time_ms", 0)
+            output_tokens = r.get("output_tokens", 0)
+            if decode_time_ms > 0 and output_tokens > 1:
+                decode_tps_values.append((output_tokens - 1) / (decode_time_ms / 1000.0))
+
+            if r["latency_ms"] > 0 and r["ttft_ms"] > 0:
+                prefill_fractions.append(r["ttft_ms"] / r["latency_ms"])
+
+        # Build result
+        br = BenchmarkResult(
             config=config,
             latency_p50=percentile(latencies, 50),
             latency_p95=percentile(latencies, 95),
@@ -230,5 +286,42 @@ class BenchmarkRunner:
             requests_per_second=len(successful) / total_time_s if total_time_s > 0 else 0.0,
             total_requests=len(results),
             failed_requests=len(failed),
+            # Prefill / decode
+            prefill_throughput_tps=statistics.mean(prefill_tps_values) if prefill_tps_values else 0.0,
+            decode_throughput_tps=statistics.mean(decode_tps_values) if decode_tps_values else 0.0,
+            decode_latency_p50_ms=percentile(all_itls, 50),
+            decode_latency_p95_ms=percentile(all_itls, 95),
+            decode_latency_p99_ms=percentile(all_itls, 99),
+            prefill_fraction=statistics.mean(prefill_fractions) if prefill_fractions else 0.0,
             individual_results=results,
         )
+
+        # Populate GPU telemetry fields
+        if gpu_telemetry:
+            br.gpu_telemetry = gpu_telemetry
+            # Use first GPU for top-level fields (backward compat)
+            primary = gpu_telemetry[0]
+            br.gpu_utilization_mean = primary.utilization_mean
+            br.peak_gpu_memory_gb = primary.memory_used_peak_mb / 1024.0
+            br.gpu_info = {
+                "name": primary.gpu_name,
+                "memory_total_gb": primary.memory_total_mb / 1024.0,
+                "gpu_count": len(gpu_telemetry),
+            }
+            br.clock_throttle_ratio = primary.clock_throttle_ratio
+
+            # Power efficiency
+            if primary.power_draw_mean_w > 0 and br.aggregate_tps > 0:
+                br.tokens_per_watt = br.aggregate_tps / primary.power_draw_mean_w
+                total_energy_j = primary.power_draw_mean_w * primary.duration_s
+                total_tokens_generated = total_tokens
+                if total_energy_j > 0 and total_tokens_generated > 0:
+                    br.tokens_per_joule = total_tokens_generated / total_energy_j
+
+            # Thermal headroom (GPU throttle temp is typically 83-90C for data center GPUs)
+            if primary.temperature_peak_c > 0 and primary.power_limit_w > 0:
+                # Use 83C as default throttle threshold for data center GPUs
+                throttle_temp = 83
+                br.thermal_headroom_c = throttle_temp - primary.temperature_peak_c
+
+        return br
