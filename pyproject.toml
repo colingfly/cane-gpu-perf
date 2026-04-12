@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "cane-gpu-perf"
 version = "0.1.0"
 description = "GPU inference benchmarking with opinionated diagnostics"
+readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [

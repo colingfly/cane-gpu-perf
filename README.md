@@ -2,6 +2,12 @@
 
 GPU inference benchmarking with opinionated diagnostics and deep hardware analysis.
 
+## Install
+
+```bash
+pip install cane-gpu-perf
+```
+
 ## Quick Start
 
 ```bash
