@@ -5,7 +5,7 @@ GPU inference benchmarking with opinionated diagnostics and deep hardware analys
 ## Install
 
 ```bash
-pip install cane-perf
+pip install cane-gpu-perf
 ```
 
 ## Quick Start
